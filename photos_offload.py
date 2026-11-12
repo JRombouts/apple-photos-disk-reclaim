@@ -7,7 +7,7 @@ keeps offloading a little at a time. When the originals folder reaches a target 
 or stops shrinking, all filler is deleted and the reclaimed space is free.
 
 Usage:
-    uvx git+https://github.com/JRombouts/apple-photos-disk-reclaim
+    uvx git+https://github.com/JRombouts/apple-photos-disk-reclaim@v0.1.0
     python3 photos_offload.py            # equivalent, from a checkout
 
 Press Ctrl-C at any time; the filler files are removed on exit. Sizes are in
@@ -17,6 +17,7 @@ SI units (1 GB = 10^9 bytes).
 from __future__ import annotations
 
 import argparse
+import fcntl
 import os
 import shutil
 import signal
@@ -33,12 +34,18 @@ ZEROS = bytes(BLOCK)
 
 
 def log(message: str) -> None:
-    """Prints a timestamped message.
+    """Prints a timestamped message, never raising if stdout has gone away.
+
+    A closed terminal or broken pipe must not stop the filler cleanup, so
+    output errors are swallowed and further output is discarded.
 
     Args:
         message: Text to print.
     """
-    print(f"{datetime.now():%H:%M:%S}  {message}", flush=True)
+    try:
+        print(f"{datetime.now():%H:%M:%S}  {message}", flush=True)
+    except OSError:
+        sys.stdout = open(os.devnull, "w")
 
 
 def gb(n_bytes: int) -> str:
@@ -82,37 +89,70 @@ class LibrarySize:
         return f"Library: {gb(self.total)} (originals {gb(self.originals)})"
 
 
+class Measurement:
+    """A ``du`` pass over a Photos library, running in the background.
+
+    ``du`` can take a while on a large library; running it in the background
+    lets the main loop keep reacting to low free space in the meantime.
+    """
+
+    def __init__(self, library: Path) -> None:
+        """Starts measuring.
+
+        Args:
+            library: Path to the ``.photoslibrary`` package.
+        """
+        self.library = library
+        self.process = subprocess.Popen(
+            ["du", "-k", "-d", "1", str(library)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+
+    def done(self) -> bool:
+        """Returns whether ``du`` has finished."""
+        return self.process.poll() is not None
+
+    def result(self) -> LibrarySize:
+        """Waits for ``du`` and returns the library's sizes.
+
+        Raises:
+            RuntimeError: If ``du`` produced no usable output, e.g. because
+                the terminal lacks Full Disk Access.
+        """
+        stdout, stderr = self.process.communicate()
+        sizes: dict[Path, int] = {}
+        for line in stdout.splitlines():
+            kib, _, path = line.partition("\t")
+            if kib.isdigit():
+                sizes[Path(path)] = int(kib) * 1024
+        if self.library not in sizes or "Operation not permitted" in stderr:
+            raise RuntimeError(
+                f"Could not measure {self.library}: {stderr.strip()}\n"
+                "Grant your terminal app Full Disk Access in System Settings > "
+                "Privacy & Security > Full Disk Access, then restart it."
+            )
+        return LibrarySize(
+            total=sizes[self.library],
+            originals=sizes.get(self.library / "originals", 0),
+        )
+
+    def cancel(self) -> None:
+        """Stops ``du`` if it is still running."""
+        if not self.done():
+            self.process.kill()
+            self.process.wait()
+
+
 def library_size(library: Path) -> LibrarySize:
-    """Measures a Photos library and its originals folder with one ``du`` pass.
+    """Measures a Photos library and its originals folder, blocking.
 
     Args:
         library: Path to the ``.photoslibrary`` package.
 
     Returns:
         The library's total and originals sizes.
-
-    Raises:
-        RuntimeError: If ``du`` produced no usable output, e.g. because
-            Terminal lacks Full Disk Access.
     """
-    result = subprocess.run(
-        ["du", "-k", "-d", "1", str(library)],
-        capture_output=True, text=True, check=False,
-    )
-    sizes: dict[Path, int] = {}
-    for line in result.stdout.splitlines():
-        kib, _, path = line.partition("\t")
-        if kib.isdigit():
-            sizes[Path(path)] = int(kib) * 1024
-    if library not in sizes or "Operation not permitted" in result.stderr:
-        raise RuntimeError(
-            f"Could not measure {library}: {result.stderr.strip()}\n"
-            "Grant your terminal app Full Disk Access in System Settings > "
-            "Privacy & Security > Full Disk Access, then restart it."
-        )
-    return LibrarySize(
-        total=sizes[library], originals=sizes.get(library / "originals", 0)
-    )
+    return Measurement(library).result()
 
 
 @dataclass
@@ -126,33 +166,45 @@ class Filler:
 
     directory: Path
     files: list[Path] = field(default_factory=list)
+    next_index: int = 0
 
     def total_bytes(self) -> int:
         """Returns the combined size of all existing filler files."""
         return sum(f.stat().st_size for f in self.files if f.exists())
 
-    def add(self, size: int) -> int:
-        """Writes a new filler file.
+    def add(self, size: int, keep_free: int) -> int:
+        """Writes a new filler file, stopping early to keep some space free.
+
+        Free space is re-checked before every block, so anything else writing
+        to the disk at the same time cannot push it past ``keep_free``. If a
+        write fails anyway (e.g. the disk filled up), the new file is deleted
+        at once instead of being left behind with the disk full.
 
         Args:
-            size: Number of bytes to write.
+            size: Maximum number of bytes to write.
+            keep_free: Stop writing before free space drops below this.
 
         Returns:
-            Number of bytes actually written (less than ``size`` if the disk
-            filled up first).
+            Number of bytes written and kept.
         """
-        path = self.directory / f"filler_{len(self.files):05d}.bin"
-        self.files.append(path)
+        path = self.directory / f"filler_{self.next_index:05d}.bin"
+        self.next_index += 1
         written = 0
         try:
-            with path.open("wb") as handle:
+            # "x" refuses to open an existing file or follow a planted symlink.
+            with path.open("xb") as handle:
+                self.files.append(path)
                 while written < size:
                     n = min(BLOCK, size - written)
+                    if free_bytes(self.directory) - n < keep_free:
+                        break
                     handle.write(memoryview(ZEROS)[:n])
                     written += n
-                handle.flush()
         except OSError as error:
-            log(f"Write stopped early ({error}); continuing.")
+            log(f"Filler write failed ({error}); discarding it.")
+            written = 0
+        if written == 0 and self.files and self.files[-1] == path:
+            self.remove_newest()
         return written
 
     def remove_newest(self) -> None:
@@ -176,7 +228,7 @@ def parse_args() -> argparse.Namespace:
     Returns:
         The parsed arguments.
     """
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
     parser.add_argument(
         "--library",
         default="~/Pictures/Photos Library.photoslibrary",
@@ -201,7 +253,7 @@ def parse_args() -> argparse.Namespace:
                         help="Stop if originals have not shrunk for this long.")
     parser.add_argument("--check-minutes", type=float, default=5.0,
                         help="How often to measure the originals folder.")
-    parser.add_argument("--poll-seconds", type=float, default=15.0,
+    parser.add_argument("--poll-seconds", type=float, default=5.0,
                         help="How often to check free space.")
     parser.add_argument("--report", action="store_true",
                         help="Print the library size and free space once.")
@@ -254,9 +306,83 @@ Library: {library}
     return answer.strip().lower() in ("y", "yes")
 
 
+MIN_CRITICAL_GB = 2.0
+
+
+def check_settings(args: argparse.Namespace) -> str | None:
+    """Rejects settings that would hold the disk dangerously low or misbehave.
+
+    Args:
+        args: Parsed command-line arguments.
+
+    Returns:
+        An error message, or None if the settings are acceptable.
+    """
+    if args.critical_gb < MIN_CRITICAL_GB:
+        return (f"--critical-gb must be at least {MIN_CRITICAL_GB:g}; macOS "
+                "needs room for swap and normal writes.")
+    if args.reserve_gb <= args.critical_gb:
+        return "--reserve-gb must be larger than --critical-gb."
+    for name in ("chunk_gb", "min_write_gb", "poll_seconds", "check_minutes"):
+        if getattr(args, name) <= 0:
+            return f"--{name.replace('_', '-')} must be positive."
+    return None
+
+
 def same_volume(a: Path, b: Path) -> bool:
     """Returns whether two existing paths live on the same volume."""
     return a.stat().st_dev == b.stat().st_dev
+
+
+def prepare_filler_dir(filler_dir: Path, library: Path) -> int | str:
+    """Creates, vets and locks the filler directory.
+
+    The directory must belong to the current user and not be writable by
+    others, so nobody else can plant files or symlinks in it. It is locked so
+    that only one run uses it at a time: a second run would otherwise delete
+    the first one's filler and both would fill the disk at once.
+
+    Args:
+        filler_dir: Directory where filler files will be written.
+        library: Path to the ``.photoslibrary`` package.
+
+    Returns:
+        A file descriptor holding the lock (keep it open for the whole run),
+        or an error message.
+    """
+    filler_dir.mkdir(mode=0o700, exist_ok=True)
+    info = filler_dir.stat()
+    if info.st_uid != os.getuid() or info.st_mode & 0o022:
+        return (f"{filler_dir} must be owned by you and not writable by "
+                "others. Pick another --filler-dir.")
+    if not same_volume(filler_dir, library):
+        Filler(filler_dir).remove_all()  # Removes the directory if empty.
+        return (f"{filler_dir} is not on the same volume as {library}; filling "
+                "it would not make Photos offload anything. Pick another "
+                "--filler-dir.")
+    fd = os.open(filler_dir, os.O_RDONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return f"Another run is already using {filler_dir}."
+    return fd
+
+
+def remove_leftovers(filler_dir: Path) -> None:
+    """Deletes filler files left behind by a run that was killed hard.
+
+    Args:
+        filler_dir: The (locked) filler directory.
+    """
+    leftovers = [f for f in sorted(filler_dir.glob("filler_*.bin"))
+                 if f.is_file() and not f.is_symlink()]
+    if leftovers:
+        stale = sum(f.stat().st_size for f in leftovers)
+        log(f"Removing {len(leftovers)} leftover filler files ({gb(stale)}) "
+            "from a previous run.")
+        for f in leftovers:
+            f.unlink(missing_ok=True)
 
 
 def keep_awake() -> None:
@@ -313,8 +439,9 @@ def run(args: argparse.Namespace) -> int:
     if args.watch:
         return watch(library, args.check_minutes * 60)
 
-    if args.reserve_gb <= args.critical_gb:
-        log("--reserve-gb must be larger than --critical-gb.")
+    error = check_settings(args)
+    if error:
+        log(error)
         return 1
     chunk = int(args.chunk_gb * GB)
     reserve = int(args.reserve_gb * GB)
@@ -326,20 +453,11 @@ def run(args: argparse.Namespace) -> int:
         log("Aborted; nothing was written.")
         return 1
 
-    filler_dir.mkdir(exist_ok=True)
-    if not same_volume(filler_dir, library):
-        log(f"{filler_dir} is not on the same volume as {library}; filling it "
-            "would not make Photos offload anything. Pick another --filler-dir.")
-        Filler(filler_dir).remove_all()  # Removes the directory if empty.
+    lock = prepare_filler_dir(filler_dir, library)
+    if isinstance(lock, str):
+        log(lock)
         return 1
-
-    leftovers = sorted(filler_dir.glob("filler_*.bin"))
-    if leftovers:
-        stale = sum(f.stat().st_size for f in leftovers)
-        log(f"Removing {len(leftovers)} leftover filler files ({gb(stale)}) "
-            "from a previous run.")
-        for f in leftovers:
-            f.unlink(missing_ok=True)
+    remove_leftovers(filler_dir)
     filler = Filler(filler_dir)
     keep_awake()
     target = int(args.target_gb * GB)
@@ -355,6 +473,7 @@ def run(args: argparse.Namespace) -> int:
     log(f"{start.describe()}   Free: {gb(free_bytes(filler_dir))}")
     log(f"Holding free space near {gb(reserve)}; Ctrl-C to stop and clean up.")
 
+    measuring: Measurement | None = None
     try:
         while True:
             free = free_bytes(filler_dir)
@@ -367,16 +486,20 @@ def run(args: argparse.Namespace) -> int:
 
             top_up = min(chunk, free - reserve)
             if top_up >= min_write and filler.total_bytes() < max_filler:
-                written = filler.add(top_up)
-                log(f"Wrote {gb(written)} filler "
-                    f"(total {gb(filler.total_bytes())}, "
-                    f"free {gb(free_bytes(filler_dir))}).")
-                continue
+                written = filler.add(top_up, keep_free=reserve)
+                if written:
+                    log(f"Wrote {gb(written)} filler "
+                        f"(total {gb(filler.total_bytes())}, "
+                        f"free {gb(free_bytes(filler_dir))}).")
+                    continue
 
             now = time.monotonic()
-            if now - last_check >= check_interval:
+            if measuring is None and now - last_check >= check_interval:
+                measuring = Measurement(library)
+            if measuring is not None and measuring.done():
+                current = measuring.result()
+                measuring = None
                 last_check = now
-                current = library_size(library)
                 size = current.originals
                 log(f"{current.describe()}   "
                     f"Freed: {gb(start.total - current.total)}   "
@@ -392,17 +515,28 @@ def run(args: argparse.Namespace) -> int:
 
             time.sleep(args.poll_seconds)
     finally:
+        # Free the disk before anything else can fail or be interrupted: a
+        # second Ctrl-C or a closed terminal must not leave the disk full.
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, signal.SIG_IGN)
+        if measuring is not None:
+            measuring.cancel()
         if args.keep_filler:
             log(f"WARNING: leaving {gb(filler.total_bytes())} of filler in "
                 f"{filler_dir}; your disk stays nearly full until you delete "
                 "it.")
         else:
-            log("Removing filler files...")
             filler.remove_all()
-            end = library_size(library)
-            log(f"Done. Library: {gb(start.total)} -> {gb(end.total)}   "
-                f"Originals: {gb(start.originals)} -> {gb(end.originals)}   "
-                f"Free: {gb(free_bytes(filler_dir.parent))}")
+            log("Removed all filler files.")
+            os.close(lock)
+            try:
+                end = library_size(library)
+                log(f"Done. Library: {gb(start.total)} -> {gb(end.total)}   "
+                    f"Originals: {gb(start.originals)} -> "
+                    f"{gb(end.originals)}   "
+                    f"Free: {gb(free_bytes(filler_dir.parent))}")
+            except RuntimeError as error:
+                log(f"Done, but could not measure the library: {error}")
     return 0
 
 

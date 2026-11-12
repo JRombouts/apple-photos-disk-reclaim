@@ -4,7 +4,7 @@ Get disk space back from Apple Photos on macOS when iCloud Photos is set to
 **Optimize Mac Storage** but Photos won't let go of the originals.
 
 ```sh
-uvx git+https://github.com/JRombouts/apple-photos-disk-reclaim
+uvx git+https://github.com/JRombouts/apple-photos-disk-reclaim@v0.1.0
 ```
 
 ## Why
@@ -30,8 +30,14 @@ condition on purpose and keeps it there until Photos has offloaded what it can.
    hour.
 5. It then deletes all the filler. What remains is the space Photos released.
 
-If free space ever drops below 3 GB, for example because another app is writing,
-the tool deletes filler right away to give room back.
+Safety nets while it runs:
+
+- Free space is re-checked before every 64 MB written, so filler never pushes
+  the disk below the reserve, even if something else is writing at the same time.
+- If free space still drops below 3 GB, the tool deletes filler right away.
+- Only one run can use the filler folder at a time.
+- Filler is deleted first thing on exit, before anything else can fail. A second
+  Ctrl-C or a closed terminal can't interrupt that.
 
 ## ⚠️ Read this first
 
@@ -76,13 +82,13 @@ anything. Pass `--yes` to skip the prompt.
 Check how big the library is and how much space is free (read-only):
 
 ```sh
-uvx git+https://github.com/JRombouts/apple-photos-disk-reclaim --report
+uvx git+https://github.com/JRombouts/apple-photos-disk-reclaim@v0.1.0 --report
 ```
 
 Run it:
 
 ```sh
-uvx git+https://github.com/JRombouts/apple-photos-disk-reclaim
+uvx git+https://github.com/JRombouts/apple-photos-disk-reclaim@v0.1.0
 ```
 
 Keep Photos open, and keep the Mac plugged in and awake. The tool runs
@@ -97,15 +103,15 @@ install.
 | Option | Default | Description |
 | --- | --- | --- |
 | `--library PATH` | `~/Pictures/Photos Library.photoslibrary` | Photos library to watch |
-| `--filler-dir PATH` | `~/photos_offload_filler` | Where filler goes; must be on the same volume as the library |
+| `--filler-dir PATH` | `~/photos_offload_filler` | Where filler goes; must be on the same volume as the library, owned by you and not writable by others |
 | `--reserve-gb N` | `7` | Keep free space at about this level |
-| `--critical-gb N` | `3` | Delete filler if free space falls below this |
+| `--critical-gb N` | `3` | Delete filler if free space falls below this (minimum 2) |
 | `--target-gb N` | `10` | Stop once `originals` has shrunk to this size |
 | `--stall-minutes N` | `60` | Stop if `originals` hasn't shrunk for this long |
 | `--chunk-gb N` | `5` | Largest size of a single filler file |
 | `--min-write-gb N` | `0.5` | Skip top-ups smaller than this |
 | `--check-minutes N` | `5` | How often to measure the library |
-| `--poll-seconds N` | `15` | How often to check free space |
+| `--poll-seconds N` | `5` | How often to check free space |
 | `--report` | | Print library size and free space once, then exit |
 | `--watch` | | Print library size every `--check-minutes`; writes nothing |
 | `-y`, `--yes` | | Skip the confirmation prompt |
