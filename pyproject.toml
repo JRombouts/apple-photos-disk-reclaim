@@ -1,0 +1,27 @@
+[project]
+name = "photos-offload"
+version = "0.1.0"
+description = "Reclaim disk space on macOS by coaxing Apple Photos into offloading originals to iCloud."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = []
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+]
+
+[project.urls]
+Repository = "https://github.com/JRombouts/apple-photos-disk-reclaim"
+
+[project.scripts]
+photos-offload = "photos_offload:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["photos_offload.py"]

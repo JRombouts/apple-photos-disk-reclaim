@@ -7,7 +7,8 @@ keeps offloading a little at a time. When the originals folder reaches a target 
 or stops shrinking, all filler is deleted and the reclaimed space is free.
 
 Usage:
-    caffeinate -i python3 photos_offload.py
+    uvx git+https://github.com/JRombouts/apple-photos-disk-reclaim
+    python3 photos_offload.py            # equivalent, from a checkout
 
 Press Ctrl-C at any time; the filler files are removed on exit. Sizes are in
 SI units (1 GB = 10^9 bytes).
@@ -16,6 +17,7 @@ SI units (1 GB = 10^9 bytes).
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import signal
 import subprocess
@@ -102,8 +104,12 @@ def library_size(library: Path) -> LibrarySize:
         kib, _, path = line.partition("\t")
         if kib.isdigit():
             sizes[Path(path)] = int(kib) * 1024
-    if library not in sizes:
-        raise RuntimeError(f"du failed on {library}: {result.stderr.strip()}")
+    if library not in sizes or "Operation not permitted" in result.stderr:
+        raise RuntimeError(
+            f"Could not measure {library}: {result.stderr.strip()}\n"
+            "Grant your terminal app Full Disk Access in System Settings > "
+            "Privacy & Security > Full Disk Access, then restart it."
+        )
     return LibrarySize(
         total=sizes[library], originals=sizes.get(library / "originals", 0)
     )
@@ -203,8 +209,65 @@ def parse_args() -> argparse.Namespace:
                         help="Print the library size every --check-minutes "
                              "until Ctrl-C, without writing any filler.")
     parser.add_argument("--keep-filler", action="store_true",
-                        help="Do not delete filler on exit (not recommended).")
+                        help="Do not delete filler on exit (not recommended: "
+                             "leaves your disk nearly full).")
+    parser.add_argument("-y", "--yes", action="store_true",
+                        help="Skip the confirmation prompt.")
     return parser.parse_args()
+
+
+def confirm(library: Path, filler_dir: Path, reserve: int) -> bool:
+    """Explains the risks of filling the disk and asks the user to proceed.
+
+    Args:
+        library: Path to the ``.photoslibrary`` package.
+        filler_dir: Directory where filler files will be written.
+        reserve: Free space, in bytes, the disk will be held at.
+
+    Returns:
+        True if the user agreed to continue.
+    """
+    print(f"""
+WARNING: this deliberately fills your disk until only ~{gb(reserve)} is free.
+
+  * It only helps if iCloud Photos is on with "Optimize Mac Storage" selected
+    (Photos > Settings > iCloud). Otherwise nothing is offloaded and the disk
+    just sits nearly full until the stall timeout.
+  * Let Photos finish uploading first. Photos only offloads originals that are
+    already in iCloud, but have a backup of anything you cannot lose.
+  * While it runs, other apps may fail to save files, and macOS may also evict
+    other purgeable data (iCloud Drive files, caches, local Time Machine
+    snapshots). Avoid heavy work on this Mac until it finishes.
+  * Filler files go in {filler_dir} and are removed on exit or Ctrl-C. If the
+    process is killed hard (kill -9, crash, power loss), delete that folder
+    yourself to get the space back.
+
+Library: {library}
+""", flush=True)
+    if not sys.stdin.isatty():
+        log("No terminal to confirm on; pass --yes to run non-interactively.")
+        return False
+    try:
+        answer = input("Continue? [y/N] ")
+    except EOFError:
+        return False
+    return answer.strip().lower() in ("y", "yes")
+
+
+def same_volume(a: Path, b: Path) -> bool:
+    """Returns whether two existing paths live on the same volume."""
+    return a.stat().st_dev == b.stat().st_dev
+
+
+def keep_awake() -> None:
+    """Prevents idle sleep for as long as this process lives, via caffeinate."""
+    try:
+        subprocess.Popen(
+            ["caffeinate", "-i", "-w", str(os.getpid())],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        log("caffeinate not available; the Mac may sleep and pause progress.")
 
 
 def watch(library: Path, interval: float) -> int:
@@ -250,17 +313,35 @@ def run(args: argparse.Namespace) -> int:
     if args.watch:
         return watch(library, args.check_minutes * 60)
 
-    filler_dir = Path(args.filler_dir).expanduser()
-    filler_dir.mkdir(exist_ok=True)
-    filler = Filler(filler_dir)
-
-    chunk = int(args.chunk_gb * GB)
-    reserve = int(args.reserve_gb * GB)
-    min_write = int(args.min_write_gb * GB)
     if args.reserve_gb <= args.critical_gb:
         log("--reserve-gb must be larger than --critical-gb.")
         return 1
+    chunk = int(args.chunk_gb * GB)
+    reserve = int(args.reserve_gb * GB)
+    min_write = int(args.min_write_gb * GB)
     critical = int(args.critical_gb * GB)
+
+    filler_dir = Path(args.filler_dir).expanduser()
+    if not args.yes and not confirm(library, filler_dir, reserve):
+        log("Aborted; nothing was written.")
+        return 1
+
+    filler_dir.mkdir(exist_ok=True)
+    if not same_volume(filler_dir, library):
+        log(f"{filler_dir} is not on the same volume as {library}; filling it "
+            "would not make Photos offload anything. Pick another --filler-dir.")
+        Filler(filler_dir).remove_all()  # Removes the directory if empty.
+        return 1
+
+    leftovers = sorted(filler_dir.glob("filler_*.bin"))
+    if leftovers:
+        stale = sum(f.stat().st_size for f in leftovers)
+        log(f"Removing {len(leftovers)} leftover filler files ({gb(stale)}) "
+            "from a previous run.")
+        for f in leftovers:
+            f.unlink(missing_ok=True)
+    filler = Filler(filler_dir)
+    keep_awake()
     target = int(args.target_gb * GB)
     stall = args.stall_minutes * 60
     check_interval = args.check_minutes * 60
@@ -312,7 +393,9 @@ def run(args: argparse.Namespace) -> int:
             time.sleep(args.poll_seconds)
     finally:
         if args.keep_filler:
-            log(f"Leaving {gb(filler.total_bytes())} of filler in {filler_dir}.")
+            log(f"WARNING: leaving {gb(filler.total_bytes())} of filler in "
+                f"{filler_dir}; your disk stays nearly full until you delete "
+                "it.")
         else:
             log("Removing filler files...")
             filler.remove_all()
@@ -325,12 +408,16 @@ def run(args: argparse.Namespace) -> int:
 
 def main() -> None:
     """Entry point: makes termination signals clean up like Ctrl-C."""
+    if sys.platform != "darwin":
+        sys.exit("photos-offload only works on macOS.")
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, lambda *_: sys.exit(1))
     try:
         sys.exit(run(parse_args()))
     except KeyboardInterrupt:
         sys.exit(130)
+    except RuntimeError as error:
+        sys.exit(str(error))
 
 
 if __name__ == "__main__":
